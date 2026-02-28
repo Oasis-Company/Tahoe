@@ -1,6 +1,7 @@
 import os
 import glob
 import argparse
+import json
 
 import torch
 import numpy as np
@@ -12,11 +13,100 @@ from transformers import TextIteratorStreamer, set_seed
 from spatiallm import Layout
 from spatiallm.pcd import load_o3d_pcd, get_points_and_colors, cleanup_pcd, Compose
 
-DETECT_TYPE_PROMPT = {
-    "all": "Detect walls, doors, windows, boxes.",
-    "arch": "Detect walls, doors, windows.",
-    "object": "Detect boxes.",
-}
+# AME semantic domain mapping
+AME_SEMANTIC_MAPPING = """
+AME semantic domain mapping:
+sofa -> Furniture.Seating.Sofa
+chair -> Furniture.Seating.Chair
+bed -> Furniture.Sleeping.Bed
+nightstand -> Furniture.Storage.Nightstand
+tv_cabinet -> Furniture.Storage.TVCabinet
+coffee_table -> Furniture.Table.CoffeeTable
+dining_table -> Furniture.Table.DiningTable
+side_table -> Furniture.Table.SideTable
+desk -> Furniture.Table.Desk
+wardrobe -> Furniture.Storage.Wardrobe
+cabinet -> Furniture.Storage.Cabinet
+bookshelf -> Furniture.Storage.Bookshelf
+mirror -> Furniture.Decoration.Mirror
+painting -> Furniture.Decoration.Painting
+curtain -> Furniture.WindowTreatment.Curtain
+carpet -> Furniture.Floor.Carpet
+plants -> Furniture.Decoration.Plants
+chandelier -> Furniture.Lighting.Chandelier
+tv -> Electronics.TV
+computer -> Electronics.Computer
+air_conditioner -> Electronics.AirConditioner
+refrigerator -> Appliances.Refrigerator
+washing_machine -> Appliances.WashingMachine
+"""
+
+# New task prompt with strong JSON constraints
+def get_task_prompt(detect_type, categories):
+    task_prompt = f"""
+You are a 3D scene structure engine.
+
+You MUST output valid JSON only.
+Do NOT output any explanation.
+Do NOT output markdown.
+Do NOT output text outside JSON.
+
+{AME_SEMANTIC_MAPPING}
+
+The output format MUST be:
+
+{{
+  "scene_meta": {{
+    "model": "SpatialLM1.1-Qwen-0.5B",
+    "coordinate_system": {{
+      "normalized_range": [0, 32],
+      "original_min": [x, y, z],
+      "original_max": [x, y, z]
+    }}
+  }},
+  "architectural": [
+    {{
+      "type": "wall",
+      "start": [x,y,z],
+      "end": [x,y,z],
+      "height": h,
+      "thickness": t,
+      "confidence": c
+    }}
+  ],
+  "objects": [
+    {{
+      "class": {{
+        "raw": "sofa",
+        "ame_domain": "Furniture.Seating.Sofa"
+      }},
+      "position": [x,y,z],
+      "rotation": rz,
+      "scale": [sx,sy,sz],
+      "confidence": c
+    }}
+  ]
+}}
+
+All numeric values must be floats.
+Confidence must be between 0 and 1.
+Output JSON only.
+"""
+    
+    if detect_type == "arch":
+        task_prompt += "\nDetect walls, doors, windows."
+    elif detect_type == "object":
+        if categories:
+            task_prompt += f"\nDetect objects: {', '.join(categories)}."
+        else:
+            task_prompt += "\nDetect objects."
+    else:  # all
+        if categories:
+            task_prompt += f"\nDetect walls, doors, windows, and objects: {', '.join(categories)}."
+        else:
+            task_prompt += "\nDetect walls, doors, windows, and objects."
+    
+    return task_prompt
 
 
 def preprocess_point_cloud(points, colors, grid_size, num_bins):
@@ -53,10 +143,9 @@ def generate_layout(
     model,
     point_cloud,
     tokenizer,
-    code_template_file,
     top_k=10,
-    top_p=0.95,
-    temperature=0.6,
+    top_p=0.9,
+    temperature=0.0,
     num_beams=1,
     seed=-1,
     max_new_tokens=4096,
@@ -66,21 +155,15 @@ def generate_layout(
     if seed >= 0:
         set_seed(seed)
 
-    # load the code template
-    with open(code_template_file, "r") as f:
-        code_template = f.read()
+    task_prompt = get_task_prompt(detect_type, categories)
+    print("Task prompt: ", task_prompt[:500], "...")  # Print only the first 500 chars for brevity
 
-    task_prompt = DETECT_TYPE_PROMPT[detect_type]
-    if detect_type != "arch" and categories:
-        task_prompt = task_prompt.replace("boxes", ", ".join(categories))
-    print("Task prompt: ", task_prompt)
-
-    prompt = f"<|point_start|><|point_pad|><|point_end|>{task_prompt} The reference code is as followed: {code_template}"
+    prompt = f"<|point_start|><|point_pad|><|point_end|>{task_prompt}"
 
     # prepare the conversation data
     if model.config.model_type == "spatiallm_qwen":
         conversation = [
-            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "You are a 3D scene structure engine. Output only JSON."},
             {"role": "user", "content": prompt},
         ]
     else:
@@ -99,7 +182,7 @@ def generate_layout(
         {"input_ids": input_ids, "point_clouds": point_cloud},
         streamer=streamer,
         max_new_tokens=max_new_tokens,
-        do_sample=True,
+        do_sample=False,  # Disable sampling for deterministic output
         use_cache=True,
         temperature=temperature,
         top_p=top_p,
@@ -117,9 +200,17 @@ def generate_layout(
     print("\nDone!")
 
     layout_str = "".join(generate_texts)
-    layout = Layout(layout_str)
-    layout.undiscretize_and_unnormalize(num_bins=model.config.point_config["num_bins"])
-    return layout
+    return layout_str
+
+
+def validate_json(output_text):
+    """Validate JSON output and retry if invalid"""
+    try:
+        parsed = json.loads(output_text)
+        return parsed, True
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error: {e}")
+        return None, False
 
 
 if __name__ == "__main__":
