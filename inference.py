@@ -227,13 +227,13 @@ if __name__ == "__main__":
         "--output",
         type=str,
         required=True,
-        help="Path to the output layout txt file or a folder to save multiple layout txt files",
+        help="Path to the output JSON file or a folder to save multiple JSON files",
     )
     parser.add_argument(
         "-m",
         "--model_path",
         type=str,
-        default="manycore-research/SpatialLM-Llama-1B",
+        default="manycore-research/SpatialLM1.1-Qwen-0.5B",
         help="Path to the model checkpoint",
     )
     parser.add_argument(
@@ -313,13 +313,6 @@ if __name__ == "__main__":
         help="A list of categories of objects to detect. If not specified, all categories will be detected.",
     )
     parser.add_argument(
-        "-t",
-        "--code_template_file",
-        type=str,
-        default="code_template.txt",
-        help="Path to the code template file",
-    )
-    parser.add_argument(
         "--top_k",
         type=int,
         default=10,
@@ -328,13 +321,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--top_p",
         type=float,
-        default=0.95,
+        default=0.9,
         help="The smallest set of most probable tokens with probabilities that add up to top_p or higher are kept",
     )
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.6,
+        default=0.0,
         help="The value used to module the next token probabilities",
     )
     parser.add_argument(
@@ -391,16 +384,16 @@ if __name__ == "__main__":
 
         points, colors = get_points_and_colors(point_cloud)
         min_extent = np.min(points, axis=0)
+        max_extent = np.max(points, axis=0)
 
         # preprocess the point cloud to tensor features
         input_pcd = preprocess_point_cloud(points, colors, grid_size, num_bins)
 
         # generate the layout
-        layout = generate_layout(
+        output_text = generate_layout(
             model,
             input_pcd,
             tokenizer,
-            args.code_template_file,
             top_k=args.top_k,
             top_p=args.top_p,
             temperature=args.temperature,
@@ -409,15 +402,86 @@ if __name__ == "__main__":
             detect_type=args.detect_type,
             categories=args.category,
         )
-        layout.translate(min_extent)
-        pred_language_string = layout.to_language_string()
+
+        # Validate JSON output
+        parsed_json, is_valid = validate_json(output_text)
+        
+        # Retry once if JSON is invalid
+        if not is_valid:
+            print("Retrying with stricter prompt...")
+            # Add "Remember: JSON only." to the prompt
+            task_prompt = get_task_prompt(args.detect_type, args.category) + "\nRemember: JSON only."
+            prompt = f"<|point_start|><|point_pad|><|point_end|>{task_prompt}"
+            
+            # Prepare conversation data
+            if model.config.model_type == "spatiallm_qwen":
+                conversation = [
+                    {"role": "system", "content": "You are a 3D scene structure engine. Output only JSON."},
+                    {"role": "user", "content": prompt},
+                ]
+            else:
+                conversation = [{"role": "user", "content": prompt}]
+            
+            input_ids = tokenizer.apply_chat_template(
+                conversation, add_generation_prompt=True, return_tensors="pt"
+            )
+            input_ids = input_ids.to(model.device)
+            
+            streamer = TextIteratorStreamer(
+                tokenizer, timeout=20.0, skip_prompt=True, skip_special_tokens=True
+            )
+            
+            generate_kwargs = dict(
+                {"input_ids": input_ids, "point_clouds": input_pcd},
+                streamer=streamer,
+                max_new_tokens=4096,
+                do_sample=False,
+                use_cache=True,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                num_beams=args.num_beams,
+            )
+            t = Thread(target=model.generate, kwargs=generate_kwargs)
+            t.start()
+            
+            print("Generating layout (retry)...\n")
+            generate_texts = []
+            for text in streamer:
+                generate_texts.append(text)
+                print(text, end="", flush=True)
+            print("\nDone with retry!")
+            
+            output_text = "".join(generate_texts)
+            parsed_json, is_valid = validate_json(output_text)
+            
+            if not is_valid:
+                print("JSON parsing failed even after retry. Skipping this file.")
+                continue
+
+        # Add coordinate system information
+        if is_valid and parsed_json:
+            if "scene_meta" not in parsed_json:
+                parsed_json["scene_meta"] = {}
+            if "coordinate_system" not in parsed_json["scene_meta"]:
+                parsed_json["scene_meta"]["coordinate_system"] = {}
+            parsed_json["scene_meta"]["coordinate_system"]["original_min"] = min_extent.tolist()
+            parsed_json["scene_meta"]["coordinate_system"]["original_max"] = max_extent.tolist()
+            parsed_json["scene_meta"]["model"] = "SpatialLM1.1-Qwen-0.5B"
+            parsed_json["scene_meta"]["coordinate_system"]["normalized_range"] = [0, 32]
+
+            # Convert to JSON string with indentation
+            output_json = json.dumps(parsed_json, indent=2)
+        else:
+            print("Failed to generate valid JSON. Skipping this file.")
+            continue
 
         # check if the output path is a file or directory
-        if os.path.splitext(args.output)[-1]:
+        if os.path.splitext(args.output)[-1] == ".json":
             with open(args.output, "w") as f:
-                f.write(pred_language_string)
+                f.write(output_json)
         else:
-            output_filename = os.path.basename(point_cloud_file).replace(".ply", ".txt")
+            output_filename = os.path.basename(point_cloud_file).replace(".ply", ".json")
             os.makedirs(args.output, exist_ok=True)
             with open(os.path.join(args.output, output_filename), "w") as f:
-                f.write(pred_language_string)
+                f.write(output_json)
